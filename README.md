@@ -44,9 +44,13 @@ nginxplus_exporter --nginx.scrape-uri="https://nginx.example.com/nginx_status" -
 
 ### Docker
 
+[![Docker Pulls](https://img.shields.io/docker/pulls/avthart/nginxplus-exporter.svg?maxAge=604800)](https://hub.docker.com/r/avthart/nginxplus-exporter/)
+
 ```bash
 docker run -p 9102:9102 avthart/nginxplus-exporter:v0.1.0 --nginx.scrape-uri="http://localhost:1080/nginx_status" 
 ```
+
+See https://hub.docker.com/r/avthart/nginxplus-exporter/
 
 ## Development
 
@@ -57,6 +61,8 @@ make build
 ```
 
 ### Testing
+
+[![CircleCI](https://circleci.com/gh/avthart/nginxplus_exporter/tree/master.svg?style=shield)](https://circleci.com/gh/avthart/nginxplus_exporter)
 
 ```bash
 make test
