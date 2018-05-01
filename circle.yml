@@ -1,6 +1,6 @@
 machine:
   environment:
-    DOCKER_IMAGE_NAME: avthart/nginxplus_exporter
+    DOCKER_IMAGE_NAME: avthart/nginxplus-exporter
     DOCKER_TEST_IMAGE_NAME: quay.io/prometheus/golang-builder:1.9-base
     REPO_PATH: github.com/avthart/nginxplus_exporter
   pre:
