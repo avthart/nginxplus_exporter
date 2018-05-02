@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"sync"
 	"time"
 
@@ -17,11 +16,7 @@ import (
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
 	"gopkg.in/alecthomas/kingpin.v2"
-)
-
-var (
-	upstreamLabelNames   = []string{"upstream", "server"}
-	serverZoneLabelNames = []string{"zone"}
+	"os"
 )
 
 // Exporter collects NGINX Plus status from the given URI and exports them using
@@ -432,6 +427,10 @@ func newStreamUpstreamMetric(namespace string, metricName string, docString stri
 	)
 }
 
+func init() {
+	prometheus.MustRegister(version.NewCollector("nginxplus_exporter"))
+}
+
 func main() {
 	var (
 		listenAddress      = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9102").String()
@@ -455,11 +454,11 @@ func main() {
 		log.Fatal(err)
 	}
 	prometheus.MustRegister(exporter)
-	prometheus.MustRegister(version.NewCollector("nginx_exporter"))
-	prometheus.Unregister(prometheus.NewProcessCollector(os.Getpid(), ""))
+	prometheus.Unregister(prometheus.NewProcessCollector(os.Getpid(), *exporterNamespace))
 	prometheus.Unregister(prometheus.NewGoCollector())
 
 	log.Infoln("Listening on", *listenAddress)
+	log.Infoln("Scraping information from", *nginxPlusScrapeURI)
 	http.Handle(*metricsPath, prometheus.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
