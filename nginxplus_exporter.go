@@ -19,16 +19,21 @@ import (
 	"os"
 )
 
-// Exporter collects NGINX Plus status from the given URI and exports them using
+const (
+	apiVersion string = "3"
+)
+
+// Exporter collects NGINX Plus API from the given URI and exports them using
 // the prometheus metrics package.
 type Exporter struct {
 	URI   string
 	mutex sync.RWMutex
-	fetch func() (io.ReadCloser, error)
+	fetch func(uri string) (io.ReadCloser, error)
 
 	up                           prometheus.Gauge
 	totalScrapes, scrapeFailures prometheus.Counter
 	serverMetrics                map[string]*prometheus.Desc
+	httpRequestsMetrics          map[string]*prometheus.Desc
 	httpServerZonesMetrics       map[string]*prometheus.Desc
 	httpUpstreamMetrics          map[string]*prometheus.Desc
 	streamServerZonesMetrics     map[string]*prometheus.Desc
@@ -42,7 +47,7 @@ func NewExporter(uri string, sslVerify bool, timeout time.Duration, namespace st
 		return nil, err
 	}
 
-	var fetch func() (io.ReadCloser, error)
+	var fetch func(uri string) (io.ReadCloser, error)
 
 	switch u.Scheme {
 	case "http", "https", "file":
@@ -74,9 +79,10 @@ func NewExporter(uri string, sslVerify bool, timeout time.Duration, namespace st
 			"ssl_handshakes":        newServerMetric(namespace, "ssl_handshakes", "The total number of successful SSL handshakes.", nil),
 			"ssl_handshakes_failed": newServerMetric(namespace, "ssl_handshakes_failed", "The total number of failed SSL handshakes.", nil),
 			"ssl_session_reuses":    newServerMetric(namespace, "ssl_session_reuses", "The total number of session reuses during SSL handshake.", nil),
-			"requests_total":        newServerMetric(namespace, "requests_total", "The total number of client requests.", nil),
-			"requests":              newServerMetric(namespace, "requests", "The current number of client requests.", nil),
-			"processes_respawned":   newServerMetric(namespace, "processes_respawned", "The total number of abnormally terminated and respawned child processes.", nil),
+		},
+		httpRequestsMetrics: map[string]*prometheus.Desc{
+			"requests_total": newHttpRequestMetric(namespace, "requests_total", "The total number of client requests.", nil),
+			"requests":       newHttpRequestMetric(namespace, "requests", "The current number of client requests.", nil),
 		},
 		httpServerZonesMetrics: map[string]*prometheus.Desc{
 			"discarded":       newHttpServerZoneMetric(namespace, "discarded", "The total number of requests completed without sending a response.", []string{"zone"}),
@@ -146,15 +152,15 @@ func NewExporter(uri string, sslVerify bool, timeout time.Duration, namespace st
 	}, nil
 }
 
-func fetchHTTP(uri string, sslVerify bool, timeout time.Duration) func() (io.ReadCloser, error) {
+func fetchHTTP(baseUri string, sslVerify bool, timeout time.Duration) func(uri string) (io.ReadCloser, error) {
 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: !sslVerify}}
 	client := http.Client{
 		Timeout:   timeout,
 		Transport: tr,
 	}
 
-	return func() (io.ReadCloser, error) {
-		resp, err := client.Get(uri)
+	return func(uri string) (io.ReadCloser, error) {
+		resp, err := client.Get(baseUri + "/" + apiVersion + "/" + uri)
 		if err != nil {
 			return nil, err
 		}
@@ -166,6 +172,19 @@ func fetchHTTP(uri string, sslVerify bool, timeout time.Duration) func() (io.Rea
 	}
 }
 
+func (e *Exporter) fetchJson(uri string, v interface{}) error {
+	body, err := e.fetch(uri)
+	if err != nil {
+		return err
+	}
+
+	dec := json.NewDecoder(bufio.NewReader(body))
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Describe describes all the metrics ever exported by the NGINX Plus exporter. It
 // implements prometheus.Collector.
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
@@ -173,6 +192,9 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 		ch <- m
 	}
 	for _, m := range e.httpUpstreamMetrics {
+		ch <- m
+	}
+	for _, m := range e.httpRequestsMetrics {
 		ch <- m
 	}
 	for _, m := range e.streamServerZonesMetrics {
@@ -197,37 +219,35 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
 	e.totalScrapes.Inc()
 
-	body, err := e.fetch()
+	body, err := e.fetch("nginx")
 	if err != nil {
 		e.up.Set(0)
 		e.scrapeFailures.Inc()
 		log.Errorf("Can't scrape NGINX Plus API: %v", err)
 		return
 	}
-
-	dec := json.NewDecoder(bufio.NewReader(body))
-	status := &nginx.Status{}
-	if err := dec.Decode(status); err != nil {
-		e.up.Set(0)
-		e.scrapeFailures.Inc()
-		log.Errorf("Can't parse JSON: %v", err)
-	}
-	scrapeConnections(status.Connections, e.serverMetrics, ch)
-	scrapeSsl(status.Ssl, e.serverMetrics, ch)
-	scrapeRequests(status.Requests, e.serverMetrics, ch)
-	scrapeHttpServerZones(status.ServerZones, e.httpServerZonesMetrics, ch)
-	scrapeHttpUpstreams(status.Upstreams, e.httpUpstreamMetrics, ch)
-	scrapeTcpServerZones(status.Stream, e.streamServerZonesMetrics, ch)
-	scrapeTcpUpstreams(status.Stream, e.streamUpstreamMetrics, ch)
-
 	defer body.Close()
+
+	e.scrapeConnections(e.serverMetrics, ch)
+	e.scrapeSsl(e.serverMetrics, ch)
+	e.scrapeHttpRequests(e.httpRequestsMetrics, ch)
+	e.scrapeHttpServerZones(e.httpServerZonesMetrics, ch)
+	e.scrapeHttpUpstreams(e.httpUpstreamMetrics, ch)
+	e.scrapeStreamServerZones(e.streamServerZonesMetrics, ch)
+	e.scrapeStreamUpstreams(e.streamUpstreamMetrics, ch)
 
 	e.up.Set(1)
 	e.totalScrapes.Inc()
 }
 
-func scrapeHttpUpstreams(upstreams nginx.Upstreams, metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
-	for upstreamName, upstream := range upstreams {
+func (e *Exporter) scrapeHttpUpstreams(metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
+	upstreams := &nginx.HttpUpstreams{}
+	if err := e.fetchJson("http/upstreams", upstreams); err != nil {
+		log.Errorf("Can't scrape http/upstreams: %v", err)
+		return
+	}
+
+	for upstreamName, upstream := range *upstreams {
 		for _, peer := range upstream.Peers {
 			ch <- prometheus.MustNewConstMetric(metrics["received"], prometheus.CounterValue, float64(peer.Received), upstreamName, peer.Server)
 			ch <- prometheus.MustNewConstMetric(metrics["sent"], prometheus.CounterValue, float64(peer.Sent), upstreamName, peer.Server)
@@ -284,8 +304,14 @@ func scrapeHttpUpstreams(upstreams nginx.Upstreams, metrics map[string]*promethe
 	}
 }
 
-func scrapeHttpServerZones(zones nginx.ServerZones, metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
-	for zoneName, zone := range zones {
+func (e *Exporter) scrapeHttpServerZones(metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
+	zones := &nginx.HttpServerZones{}
+	if err := e.fetchJson("http/server_zones", zones); err != nil {
+		log.Errorf("Can't scrape http/server_zones: %v", err)
+		return
+	}
+
+	for zoneName, zone := range *zones {
 		zoneLabels := make(map[string]string)
 		zoneLabels["zone"] = zoneName
 
@@ -305,8 +331,14 @@ func scrapeHttpServerZones(zones nginx.ServerZones, metrics map[string]*promethe
 	}
 }
 
-func scrapeTcpUpstreams(stream nginx.Stream, metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
-	for upstreamName, upstream := range stream.Upstreams {
+func (e *Exporter) scrapeStreamUpstreams(metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
+	upstreams := &nginx.StreamUpstreams{}
+	if err := e.fetchJson("stream/upstreams", upstreams); err != nil {
+		log.Errorf("Can't scrape stream/upstreams: %v", err)
+		return
+	}
+
+	for upstreamName, upstream := range *upstreams {
 		for _, peer := range upstream.Peers {
 			ch <- prometheus.MustNewConstMetric(metrics["received"], prometheus.CounterValue, float64(peer.Received), upstreamName, peer.Server)
 			ch <- prometheus.MustNewConstMetric(metrics["sent"], prometheus.CounterValue, float64(peer.Sent), upstreamName, peer.Server)
@@ -354,8 +386,14 @@ func scrapeTcpUpstreams(stream nginx.Stream, metrics map[string]*prometheus.Desc
 	}
 }
 
-func scrapeTcpServerZones(stream nginx.Stream, metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
-	for zoneName, zone := range stream.ServerZones {
+func (e *Exporter) scrapeStreamServerZones(metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
+	zones := &nginx.StreamServerZones{}
+	if err := e.fetchJson("stream/server_zones", zones); err != nil {
+		log.Errorf("Can't scrape stream/server_zones: %v", err)
+		return
+	}
+
+	for zoneName, zone := range *zones {
 		zoneLabels := make(map[string]string)
 		zoneLabels["zone"] = zoneName
 
@@ -374,18 +412,36 @@ func scrapeTcpServerZones(stream nginx.Stream, metrics map[string]*prometheus.De
 	}
 }
 
-func scrapeSsl(ssl nginx.Ssl, metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
+func (e *Exporter) scrapeSsl(metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
+	ssl := &nginx.Ssl{}
+	if err := e.fetchJson("ssl", ssl); err != nil {
+		log.Errorf("Can't scrape ssl: %v", err)
+		return
+	}
+
 	ch <- prometheus.MustNewConstMetric(metrics["ssl_handshakes"], prometheus.CounterValue, float64(ssl.Handshakes))
 	ch <- prometheus.MustNewConstMetric(metrics["ssl_handshakes_failed"], prometheus.CounterValue, float64(ssl.HandshakesFailed))
 	ch <- prometheus.MustNewConstMetric(metrics["ssl_session_reuses"], prometheus.CounterValue, float64(ssl.SessionReuses))
 }
 
-func scrapeRequests(requests nginx.Requests, metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
+func (e *Exporter) scrapeHttpRequests(metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
+	requests := &nginx.Requests{}
+	if err := e.fetchJson("http/requests", requests); err != nil {
+		log.Errorf("Can't scrape http/requests: %v", err)
+		return
+	}
+
 	ch <- prometheus.MustNewConstMetric(metrics["requests_total"], prometheus.CounterValue, float64(requests.Total))
 	ch <- prometheus.MustNewConstMetric(metrics["requests"], prometheus.GaugeValue, float64(requests.Current))
 }
 
-func scrapeConnections(connections nginx.Connections, metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
+func (e *Exporter) scrapeConnections(metrics map[string]*prometheus.Desc, ch chan<- prometheus.Metric) {
+	connections := &nginx.Connections{}
+	if err := e.fetchJson("connections", connections); err != nil {
+		log.Errorf("Can't scrape connections: %v", err)
+		return
+	}
+
 	ch <- prometheus.MustNewConstMetric(metrics["connections"], prometheus.GaugeValue, float64(connections.Accepted), "accepted")
 	ch <- prometheus.MustNewConstMetric(metrics["connections"], prometheus.GaugeValue, float64(connections.Dropped), "dropped")
 	ch <- prometheus.MustNewConstMetric(metrics["connections"], prometheus.GaugeValue, float64(connections.Active), "active")
@@ -395,6 +451,13 @@ func scrapeConnections(connections nginx.Connections, metrics map[string]*promet
 func newServerMetric(namespace string, metricName string, docString string, labels []string) *prometheus.Desc {
 	return prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "server", metricName),
+		docString, labels, nil,
+	)
+}
+
+func newHttpRequestMetric(namespace string, metricName string, docString string, labels []string) *prometheus.Desc {
+	return prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "http", metricName),
 		docString, labels, nil,
 	)
 }
@@ -435,7 +498,7 @@ func main() {
 	var (
 		listenAddress      = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9102").String()
 		metricsPath        = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
-		nginxPlusScrapeURI = kingpin.Flag("nginx.scrape-uri", "URI on which to scrape NGINX Plus Status API.").Default("http://localhost:1080/nginx_status").String()
+		nginxPlusScrapeURI = kingpin.Flag("nginx.scrape-uri", "URI on which to scrape NGINX Plus Status API.").Default("http://localhost:1080/api").String()
 		nginxPlusSSLVerify = kingpin.Flag("nginx.ssl-verify", "Flag that enables SSL certificate verification for the scrape URI.").Default("true").Bool()
 		nginxPlusTimeout   = kingpin.Flag("nginx.timeout", "Timeout for trying to get stats from NGINX Plus Status API.").Default("5s").Duration()
 		exporterNamespace  = kingpin.Flag("exporter.namespace", "Namespace for the prometheus metrics. Default is nginx").Default("nginx").String()
