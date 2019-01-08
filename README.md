@@ -1,3 +1,8 @@
+# DEPRECATED
+This project is not longer maintained. Please use the official NGINX Plus Exporter:
+
+https://github.com/nginxinc/nginx-prometheus-exporter
+
 # nginxplus_exporter
 
 This is a simple server that scrapes NGINX Plus stats and exports them via HTTP for Prometheus consumption.
